@@ -10,12 +10,21 @@ terraform {
       source = "aliyun/alicloud"
 
       # Pin a stable 1.x provider instead of accidentally moving to a 2.x beta.
-      version = "1.285.0"
+      version = ">= 1.288.0, < 2.0.0"
+    }
+    http = {
+      source  = "hashicorp/http"
+      version = "~> 3.0"
     }
   }
 }
 
 
+###############################################################################
+# find out my ip
+data "http" "my_public_ip" {
+  url = "https://checkip.amazonaws.com"
+}
 ###############################################################################
 # Variables
 ###############################################################################
@@ -36,7 +45,7 @@ variable "cluster_name" {
 variable "worker_count" {
   description = "Number of Kubernetes worker nodes"
   type        = number
-  default     = 2
+  default     = 1
 }
 
 # This is deliberately small for a learning cluster.
@@ -55,6 +64,11 @@ variable "worker_memory_gib" {
   default     = 4
 }
 
+variable "ssh_key_name" {
+  description = "Existing Alibaba Cloud ECS SSH key pair"
+  type        = string
+  default     = "ssh-ed25519"
+}
 
 ###############################################################################
 # Provider
@@ -215,6 +229,11 @@ locals {
   )
 }
 
+locals {
+  my_public_ip   = trimspace(data.http.my_public_ip.response_body)
+  my_public_cidr = "${local.my_public_ip}/32"
+}
+
 ###############################################################################
 # Kubernetes Worker node pool
 ###############################################################################
@@ -253,8 +272,53 @@ resource "alicloud_cs_kubernetes_node_pool" "workers" {
 
   # Standard Alibaba Cloud Linux image for ACK workers.
   image_type = "AliyunLinux3ContainerOptimized"
+
+  key_name = var.ssh_key_name
+
+  containerd_config {
+    registry_mirrors = [
+      "docker.io=https://9vwo7lsp.mirror.aliyuncs.com"
+    ]
+  }
 }
 
+resource "alicloud_cs_kubernetes_node_pool" "public_test" {
+  cluster_id     = alicloud_cs_managed_kubernetes.lab.id
+  node_pool_name = "public-test"
+
+  vswitch_ids = [
+    alicloud_vswitch.lab.id
+  ]
+
+  instance_types = local.worker_instance_types
+
+  instance_charge_type = "PostPaid"
+  desired_size         = var.worker_count
+
+  system_disk_category = "cloud_efficiency"
+  system_disk_size     = 40
+
+  image_type = "AliyunLinux3ContainerOptimized"
+
+  install_cloud_monitor = false
+
+  # Give this ECS worker a normal Alibaba Cloud public IP.
+  internet_charge_type       = "PayByTraffic"
+  internet_max_bandwidth_out = 5
+
+  key_name = var.ssh_key_name
+
+  containerd_config {
+    registry_mirrors = [
+      "docker.io=https://9vwo7lsp.mirror.aliyuncs.com"
+    ]
+  }
+
+  labels {
+    key   = "lab/public-node"
+    value = "true"
+  }
+}
 
 ###############################################################################
 # kubeconfig
@@ -274,6 +338,49 @@ data "alicloud_cs_cluster_credential" "lab" {
   ]
 }
 
+###############################################################################
+
+data "alicloud_cs_clusters" "lab" {
+  ids = [
+    alicloud_cs_managed_kubernetes.lab.id
+  ]
+
+  enable_details = true
+
+}
+
+resource "alicloud_security_group_rule" "nodeport" {
+  security_group_id = data.alicloud_cs_clusters.lab.clusters[0].security_group_id
+
+  type        = "ingress"
+  ip_protocol = "tcp"
+
+  port_range = "30000/32767"
+
+  # For a temporary experiment this permits access from anywhere.
+  # A fixed personal public-IP /32 would be safer.
+  cidr_ip = local.my_public_cidr
+
+  policy   = "accept"
+  priority = 1
+
+  description = "Kubernetes NodePort lab from my public IP"
+}
+
+resource "alicloud_security_group_rule" "ssh" {
+  security_group_id = data.alicloud_cs_clusters.lab.clusters[0].security_group_id
+
+  type        = "ingress"
+  ip_protocol = "tcp"
+  port_range  = "22/22"
+
+  cidr_ip = local.my_public_cidr
+
+  policy   = "accept"
+  priority = 1
+
+  description = "SSH from my current public IP"
+}
 
 ###############################################################################
 # Useful outputs
@@ -313,4 +420,16 @@ output "worker_count" {
 
 output "kubeconfig" {
   value = "${path.module}/kubeconfig"
+}
+
+output "public_test_worker_security_group" {
+  value = data.alicloud_cs_clusters.lab.clusters[0].security_group_id
+}
+
+output "detected_public_ip" {
+  value = local.my_public_ip
+}
+
+output "nodeport_allowed_cidr" {
+  value = local.my_public_cidr
 }

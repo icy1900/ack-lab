@@ -5,3 +5,7 @@ terraform.tfstate.*
 crash.log
 kubeconfig
 aliyun_accesskey
+acr_login_credentials
+command.md
+command.sh
+destroy.sh
